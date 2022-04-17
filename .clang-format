@@ -1,0 +1,21 @@
+BasedOnStyle: Google
+
+AccessModifierOffset: -2
+IndentWidth: 2
+PointerAlignment: Left
+ColumnLimit: 0
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass:      false
+  AfterControlStatement: false
+  AfterEnum:       false
+  AfterFunction:   false
+  AfterNamespace:  false
+  AfterObjCDeclaration: false
+  AfterStruct:     false
+  AfterUnion:      false
+  BeforeCatch:     false
+  BeforeElse:      false
+  IndentBraces:    false
+NamespaceIndentation: All
+IndentCaseLabels: true
