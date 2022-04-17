@@ -24,6 +24,7 @@ project "fta2"
   kind "WindowedApp"
   targetdir "project/bin/%{cfg.platform}/%{cfg.buildcfg}"
   files {"src/**.h", "src/**.cpp"}
+  files { "src/res/rockstar.ico", "src/res/resources.rc" }
   includedirs { "src" }
   editandcontinue "Off"
   staticruntime "On"
