@@ -1,14 +1,10 @@
 #include "styles.h"
-#include "ext/string_hash.h"
 #include "io.h"
 #include "ext/stb_image_write.h"
+#include "ext/string_hash.h"
 #include <filesystem>
 #include <format>
 #include <vector>
-
-constexpr uint32_t kNumColorsPerPalette = 256;
-constexpr uint32_t kPalettesPerPalettePage = 64;
-constexpr uint32_t kNumPhysicalPalettes = 16384;
 
 enum SurfaceType : uint8_t {
   SurfaceType_Grass = 0,
@@ -37,13 +33,6 @@ struct SpriteDelta {
 struct MapObject {
   uint8_t model;
   uint8_t sprites;
-};
-
-struct Sprite {
-  uint32_t offset; // Offset relative to the start of the sprite graphics data
-  uint8_t width;
-  uint8_t height;
-  uint16_t pad;
 };
 
 struct PaletteCounts {
@@ -189,6 +178,48 @@ static Tiles read_tiles(Reader& r, size_t chunk_size) {
   return result;
 }
 
+using IndexedColor = uint8_t;
+
+using SpriteStore = std::vector<IndexedColor>;
+
+static SpriteStore read_sprite_store(Reader& r, size_t chunk_size) {
+  SpriteStore result(chunk_size);
+  r.read_many<uint8_t>(result.data(), chunk_size);
+  return result;
+}
+
+struct Sprite {
+  uint32_t offset; // sprite store offset
+  uint8_t width;
+  uint8_t height;
+};
+
+using Sprites = std::vector<Sprite>;
+
+static Sprites read_sprites(Reader& r, size_t chunk_size) {
+  struct SpriteTransfer {
+    uint32_t offset; // sprite store offset
+    uint8_t  width;
+    uint8_t  height;
+    uint16_t pad;
+  };
+
+  size_t count = chunk_size / sizeof(SpriteTransfer);
+
+  Sprites result(count);
+
+  for (size_t i = 0; i < count; ++i) {
+    auto s = r.read<SpriteTransfer>();
+    result[i] = Sprite{
+      .offset = s.offset,
+      .width = s.width,
+      .height = s.height,
+    };
+  }
+
+  return result;
+}
+
 struct SpriteBase {
   uint16_t offset;
   uint16_t count;
@@ -322,8 +353,6 @@ void read_styles(const char* filename) {
   std::vector<uint8_t> delta_store;
   std::vector<MapObject> object_infos;
   std::vector<uint8_t> recyclable_cars;
-  std::vector<uint8_t> sprite_data_store;
-  std::vector<Sprite> sprites;
   std::vector<CarInfo> cars;
   Surface surfaces[SurfaceType_Count];
 
@@ -331,6 +360,8 @@ void read_styles(const char* filename) {
   PhysicalPalettes palettes;
   PaletteBases palette_bases;
   SpriteBases sprite_bases;
+  SpriteStore sprite_store;
+  Sprites sprites;
   Tiles tiles;
 
   while (!r.done()) {
@@ -363,18 +394,14 @@ void read_styles(const char* filename) {
         tiles = read_tiles(r, chunk_size);
         break;
 
-      case shash("SPRG").value(): // Sprite graphics
-        sprite_data_store.resize(chunk_size);
-        r.read_many<uint8_t>(sprite_data_store.data(), chunk_size);
+      case shash("SPRG").value():
+        sprite_store = read_sprite_store(r, chunk_size);
         break;
 
-      case shash("SPRX").value(): { // Sprite index
-        assert(chunk_size % sizeof(Sprite) == 0);
-        size_t count = chunk_size / sizeof(Sprite);
-        sprites.resize(count);
-        r.read_many<Sprite>(sprites.data(), count);
+      case shash("SPRX").value():
+        assert(chunk_size % 8 == 0);
+        sprites = read_sprites(r, chunk_size);
         break;
-      }
 
       case shash("DELS").value(): // Delta store
         delta_store.resize(chunk_size);
@@ -493,12 +520,15 @@ void read_styles(const char* filename) {
     }
   }
 
+  #if 0
   { // Dump palettes
     int width = static_cast<int>(kPhysicalPaletteSize);
     int height = static_cast<int>(palettes.size());
     stbi_write_png("palettes.png", width, height, 4, palettes.data(), sizeof(PhysicalPalette));
   }
+  #endif
 
+  #if 0
   { // Dump tiles
     if (!std::filesystem::exists("tiles")) {
       std::filesystem::create_directory("tiles");
@@ -523,10 +553,42 @@ void read_styles(const char* filename) {
       virtual_palette_index++;
     }
   }
+  #endif
 
   { // Dump sprites
     if (!std::filesystem::exists("sprites")) {
       std::filesystem::create_directory("sprites");
+    }
+
+    constexpr size_t kMaxSpriteWidth = 256;
+    constexpr size_t kMaxSpriteHeight = 256;
+    std::vector<Color> buf(kMaxSpriteWidth * kMaxSpriteHeight);
+
+    constexpr size_t kPageSize = 256;
+    auto sprite_color_index = [](SpriteStore& store, size_t xoffset, size_t yoffset, size_t x, size_t y) {
+      return store[xoffset + x + (yoffset + y) * kPageSize];
+    };
+
+    size_t virtual_palette_index = palette_bases.sprite.offset;
+
+    for (const auto& sprite : sprites) {
+      size_t physical_palette_index = vtable.map[virtual_palette_index];
+      auto& palette = palettes[physical_palette_index];
+
+      size_t xoffset = sprite.offset % kPageSize;
+      size_t yoffset = sprite.offset / kPageSize;
+
+      for (size_t y = 0; y < sprite.height; ++y) {
+        for (size_t x = 0; x < sprite.width; ++x) {
+          auto color_index = sprite_color_index(sprite_store, xoffset, yoffset, x, y);
+          buf[x + y * sprite.width] = palette.colors[color_index];
+        }
+      }
+
+      auto filename = std::format("sprites/sprite{}.png", virtual_palette_index);
+      stbi_write_png(filename.c_str(), sprite.width, sprite.height, 4, buf.data(), sprite.width * sizeof(Color));
+
+      virtual_palette_index++;
     }
   }
 }
