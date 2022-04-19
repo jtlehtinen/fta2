@@ -1,9 +1,8 @@
 #include "styles.h"
-
-#include <vector>
-
 #include "ext/string_hash.h"
 #include "io.h"
+#include "ext/stb_image_write.h"
+#include <vector>
 
 constexpr uint32_t kNumColorsPerPalette = 256;
 constexpr uint32_t kPalettesPerPalettePage = 64;
@@ -25,10 +24,6 @@ enum SurfaceType : uint8_t {
 
 struct PaletteIndex {
   uint16_t physical_palette[16384];  // Mapping of a virtual palette number to physical palette number.
-};
-
-struct Palette {
-  uint32_t colors[256];
 };
 
 struct PalettedTile {
@@ -54,9 +49,9 @@ struct SpriteDelta {
   std::vector<uint16_t> sizes;
 };
 
-struct ObjectInfo {
-    uint8_t model;      // Object model number.
-    uint8_t sprites;    // Number of sprites stored for this model.
+struct MapObject {
+  uint8_t model;
+  uint8_t sprites;
 };
 
 struct Sprite {
@@ -106,11 +101,6 @@ struct Surface {
   std::vector<uint16_t> tiles;
 };
 
-struct StyleFileHeader {
-  char file_type[4];
-  uint16_t version;
-};
-
 struct ChunkType {
   char name[4];
 };
@@ -121,28 +111,33 @@ void read_styles(const char* filename) {
     return;
   }
 
-  auto size = f.size();
-
-  std::vector<uint8_t> buf(size);
-  f.read(buf.data(), size);
+  auto fsize = f.size();
+  std::vector<uint8_t> buf(fsize);
+  if (!f.read(buf.data(), fsize)) {
+    return;
+  }
   f.close();
 
   Reader r(buf.data(), buf.size());
 
-  auto header = r.read<StyleFileHeader>();
-  if (memcmp(header.file_type, "GBST", 4) != 0) {
+  char magic[4];
+  r.read_many<char>(magic, 4);
+  if (memcmp(magic, "GBST", 4) != 0) {
     // @TODO: Error not a valid GBH style file.
     return;
   }
 
+  r.skip(sizeof(uint16_t)); // skip version
+
+  Styles styles;
+
   PaletteIndex palette_index;
-  std::vector<Palette> palettes;
   std::vector<PalettedTile> paletted_tiles;
   SpriteCounts sprite_counts;
   FontBase font_base;
   std::vector<SpriteDelta> sprite_deltas;
   std::vector<uint8_t> delta_store;
-  std::vector<ObjectInfo> object_infos;
+  std::vector<MapObject> object_infos;
   std::vector<uint8_t> recyclable_cars;
   std::vector<uint8_t> sprite_data_store;
   std::vector<Sprite> sprites;
@@ -151,39 +146,51 @@ void read_styles(const char* filename) {
   Surface surfaces[SurfaceType_Count];
 
   while (!r.done()) {
-    auto type = r.read<ChunkType>();
-    auto size = r.read<uint32_t>();
+    auto chunk_type = r.read<ChunkType>();
+    auto chunk_size = r.read<uint32_t>();
 
-    switch (shash(type.name, 4).value()) {
+    switch (shash(chunk_type.name, 4).value()) {
       case shash("PALX").value(): {  // Palette index
-        assert(size == sizeof(PaletteIndex));
+        assert(chunk_size == sizeof(PaletteIndex));
         r.read_many<uint16_t>(palette_index.physical_palette, 16384);
         break;
       }
 
       case shash("PPAL").value(): {  // Physical palettes
-        // page := 64 palettes
-        // palette := 256 dword colors
-        // color := byte order BGRA
+        // Each page contains 64 palettes. Each palette
+        // contains 256 dword colors. Color byte order
+        // is BGRA.
         //
         // Within a page palettes are stored interleaved, i.e.
         // C0P0   - C0P1   - ... - C0P63
         // C1P0   - C1P1   - ... - C1P63
         // ...
         // C255P0 - C255P1 - ... - C255P63
+        //
+        // Where CiPi, is ith color of ith palette.
 
-        assert(size % sizeof(Palette) == 0);
+        assert(chunk_size % sizeof(Palette) == 0);
 
-        size_t count = size / sizeof(Palette);
-        size_t pages = count / 64;
+        constexpr size_t kPageSize = 64;
+        size_t count = chunk_size / sizeof(Palette);
+        size_t pages = count / kPageSize;
+        styles.palettes.resize(count);
 
-        palettes.resize(count);
+        auto convert = [](uint32_t color) {
+          uint8_t alpha = static_cast<uint8_t>(color > 0 ? 0xff : 0); // @TODO: no alpha?
+          return Color{
+            .r = (color >> 16) & 0xff,
+            .g = (color >>  8) & 0xff,
+            .b = (color >>  0) & 0xff,
+            .a = alpha,
+          };
+        };
 
         for (size_t page = 0; page < pages; ++page) {
-          for (size_t color = 0; color < 256; ++color) {
-            for (size_t palette = 0; palette < 64; ++palette) {
-              size_t palette_index = page * 64 + palette;
-              palettes[palette_index].colors[color] = r.read<uint32_t>();  // @TODO: Convert to RGBA
+          for (size_t color = 0; color < kPaletteSize; ++color) {
+            for (size_t palette = 0; palette < kPageSize; ++palette) {
+              size_t idx = page * kPageSize + palette;
+              styles.palettes[idx].colors[color] = convert(r.read<uint32_t>());
             }
           }
         }
@@ -191,7 +198,7 @@ void read_styles(const char* filename) {
       }
 
       case shash("PALB").value():  // Palette base
-        assert(size == sizeof(PaletteCounts));
+        assert(chunk_size == sizeof(PaletteCounts));
         palette_counts = r.read<PaletteCounts>();
         break;
 
@@ -208,11 +215,11 @@ void read_styles(const char* filename) {
         constexpr size_t page_width_in_tiles = page_width_in_pixels / tile_width;
         constexpr size_t page_height_in_tiles = page_height_in_pixels / tile_height;
 
-        size_t count = size / (tile_width * tile_height);
+        size_t count = chunk_size / (tile_width * tile_height);
         paletted_tiles.resize(count);
 
         const uint8_t* data = r.get_ptr<uint8_t>();
-        r.skip(size);
+        r.skip(chunk_size);
 
         for (size_t tile_index = 0; tile_index < count; ++tile_index) {
           auto& tile = paletted_tiles[tile_index];
@@ -232,32 +239,32 @@ void read_styles(const char* filename) {
       }
 
       case shash("SPRG").value(): // Sprite graphics
-        sprite_data_store.resize(size);
-        r.read_many<uint8_t>(sprite_data_store.data(), size);
+        sprite_data_store.resize(chunk_size);
+        r.read_many<uint8_t>(sprite_data_store.data(), chunk_size);
         break;
 
       case shash("SPRX").value(): { // Sprite index
-        assert(size % sizeof(Sprite) == 0);
-        size_t count = size / sizeof(Sprite);
+        assert(chunk_size % sizeof(Sprite) == 0);
+        size_t count = chunk_size / sizeof(Sprite);
         sprites.resize(count);
         r.read_many<Sprite>(sprites.data(), count);
         break;
       }
 
       case shash("SPRB").value(): { // Sprite base index
-        assert(size == sizeof(SpriteCounts));
+        assert(chunk_size == sizeof(SpriteCounts));
         sprite_counts = r.read<SpriteCounts>();
         break;
       }
 
       case shash("DELS").value(): // Delta store
-        delta_store.resize(size);
-        r.read_many<uint8_t>(delta_store.data(), size);
+        delta_store.resize(chunk_size);
+        r.read_many<uint8_t>(delta_store.data(), chunk_size);
         break;
 
       case shash("DELX").value(): { // Delta index
         size_t bytes = 0;
-        while (bytes < size) {
+        while (bytes < chunk_size) {
           SpriteDelta delta;
           delta.sprite = r.read<uint16_t>();
           uint8_t count = r.read<uint8_t>();
@@ -283,7 +290,7 @@ void read_styles(const char* filename) {
 
       case shash("CARI").value(): { // Car info
         size_t bytes = 0;
-        while (bytes < size) {
+        while (bytes < chunk_size) {
           CarInfo info = { };
           info.model = r.read<uint8_t>();
           info.sprite = r.read<uint8_t>();
@@ -316,11 +323,11 @@ void read_styles(const char* filename) {
       }
 
       case shash("OBJI").value(): { // Map object info
-        assert(size % sizeof(ObjectInfo) == 0);
-        size_t count = size / sizeof(ObjectInfo);
+        assert(chunk_size % sizeof(MapObject) == 0);
+        size_t count = chunk_size / sizeof(MapObject);
 
         object_infos.resize(count);
-        r.read_many<ObjectInfo>(object_infos.data(), count);
+        r.read_many<MapObject>(object_infos.data(), count);
         break;
       }
 
@@ -328,9 +335,9 @@ void read_styles(const char* filename) {
         break;
 
       case shash("RECY").value(): // Car recycling info
-        assert(size <= 64);
+        assert(chunk_size <= 64);
 
-        for (size_t i = 0; i < size; ++i) {
+        for (size_t i = 0; i < chunk_size; ++i) {
           uint8_t value = r.read<uint8_t>();
           if (value == 255) break;
 
@@ -342,10 +349,10 @@ void read_styles(const char* filename) {
         uint8_t type = 0;
         size_t bytes = 0;
 
-        while (type < SurfaceType_Count && bytes < size) {
+        while (type < SurfaceType_Count && bytes < chunk_size) {
           Surface surface;
 
-          while (bytes < size) {
+          while (bytes < chunk_size) {
             uint16_t value = r.read<uint16_t>();
             bytes += sizeof(uint16_t);
             if (value == 0) break;
@@ -363,5 +370,21 @@ void read_styles(const char* filename) {
         // @TODO: Error unknown chunk type...
         break;
     }
+  }
+
+
+  { // Dump palettes
+    std::vector<Color> buf;
+    buf.reserve(styles.palettes.size() * kPaletteSize * sizeof(Color));
+    for (const auto& p : styles.palettes) {
+      for (size_t i = 0; i < kPaletteSize; ++i) {
+        buf.push_back(p.colors[i]);
+      }
+    }
+
+    int width = static_cast<int>(kPaletteSize);
+    int height = static_cast<int>(styles.palettes.size());
+
+    stbi_write_png("palettes.png", width, height, 4, buf.data(), 4 * width);
   }
 }
