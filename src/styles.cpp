@@ -2,6 +2,8 @@
 #include "ext/string_hash.h"
 #include "io.h"
 #include "ext/stb_image_write.h"
+#include <filesystem>
+#include <format>
 #include <vector>
 
 constexpr uint32_t kNumColorsPerPalette = 256;
@@ -20,23 +22,6 @@ enum SurfaceType : uint8_t {
   SurfaceType_GrassWall = 8,
 
   SurfaceType_Count
-};
-
-struct PaletteIndex {
-  uint16_t physical_palette[16384];  // Mapping of a virtual palette number to physical palette number.
-};
-
-struct PalettedTile {
-  uint8_t color_indices[64 * 64];  // tile width * tile height
-};
-
-struct SpriteCounts {
-  uint16_t car;
-  uint16_t ped;
-  uint16_t code_object;
-  uint16_t map_object;
-  uint16_t user;
-  uint16_t font;
 };
 
 struct FontBase {
@@ -105,6 +90,209 @@ struct ChunkType {
   char name[4];
 };
 
+constexpr size_t kVirtualPaletteTableSize = 16384;
+
+struct VirtualPaletteTable {
+  uint16_t map[kVirtualPaletteTableSize]; // Virtual index to 'physical' index.
+};
+static_assert(sizeof(VirtualPaletteTable) == kVirtualPaletteTableSize * sizeof(uint16_t));
+
+static VirtualPaletteTable read_virtual_palette_table(Reader& r) {
+  VirtualPaletteTable result;
+  r.read_many<uint16_t>(result.map, kVirtualPaletteTableSize);
+  return result;
+}
+
+struct Color {
+  uint8_t r, g, b, a;
+};
+static_assert(sizeof(Color) == 4);
+
+// kPaletteSize is the number of colors stored in a single palette.
+constexpr size_t kPhysicalPaletteSize = 256;
+
+struct PhysicalPalette {
+  Color colors[kPhysicalPaletteSize];
+};
+
+using PhysicalPalettes = std::vector<PhysicalPalette>;
+
+static PhysicalPalettes read_physical_palettes(Reader& r, size_t chunk_size) {
+  // Each page contains 64 palettes. Each palette
+  // contains 256 dword colors. Color byte order
+  // is BGRA.
+  //
+  // Within a page palettes are stored interleaved, i.e.
+  // C0P0   - C0P1   - ... - C0P63
+  // C1P0   - C1P1   - ... - C1P63
+  // ...
+  // C255P0 - C255P1 - ... - C255P63
+  //
+  // Where CiPi, is ith color of ith palette.
+
+  auto convert = [](uint32_t color) {
+    // @TODO: palette contains no alpha?
+    return Color{
+      .r = (color >> 16) & 0xff,
+      .g = (color >>  8) & 0xff,
+      .b = (color >>  0) & 0xff,
+      .a = 0xff,
+    };
+  };
+
+  constexpr size_t kPageSize = 64;
+  size_t count = chunk_size / sizeof(PhysicalPalette);
+  size_t pages = count / kPageSize;
+
+  PhysicalPalettes result(count);
+
+  for (size_t page = 0; page < pages; ++page) {
+    for (size_t color = 0; color < kPhysicalPaletteSize; ++color) {
+      for (size_t palette = 0; palette < kPageSize; ++palette) {
+        size_t idx = page * kPageSize + palette;
+        result[idx].colors[color] = convert(r.read<uint32_t>());
+      }
+    }
+  }
+
+  return result;
+}
+
+constexpr size_t kTileDim = 64;
+
+struct Tile {
+  uint8_t colors[kTileDim * kTileDim];
+};
+
+using Tiles = std::vector<Tile>;
+
+static Tiles read_tiles(Reader& r, size_t chunk_size) {
+  constexpr size_t kPageDimPixels = 256;
+  constexpr size_t kPageDimTiles = kPageDimPixels / kTileDim;
+  const size_t count = chunk_size / sizeof(Tile);
+
+  const uint8_t* data = r.get_ptr<uint8_t>();
+  r.skip(chunk_size);
+
+  Tiles result(count);
+  for (size_t tile = 0; tile < count; ++tile) {
+    for (size_t y = 0; y < kTileDim; ++y) {
+      for (size_t x = 0; x < kTileDim; ++x) {
+        size_t row = tile / kPageDimTiles;
+        size_t col = tile % kPageDimTiles;
+
+        size_t idx = x + col * kTileDim + (y + row * kTileDim) * kPageDimPixels;
+        result[tile].colors[x + y * kTileDim] = data[idx];
+      }
+    }
+  }
+  return result;
+}
+
+struct SpriteBase {
+  uint16_t offset;
+  uint16_t count;
+};
+
+struct SpriteBases {
+  SpriteBase car;
+  SpriteBase ped;
+  SpriteBase code; // code object
+  SpriteBase map;  // map object
+  SpriteBase user;
+  SpriteBase font;
+};
+
+static SpriteBases read_sprite_bases(Reader& r) {
+  struct {
+    uint16_t car;
+    uint16_t ped;
+    uint16_t code; // code object
+    uint16_t map;  // map object
+    uint16_t user;
+    uint16_t font;
+  } counts;
+
+  counts.car  = r.read<uint16_t>();
+  counts.ped  = r.read<uint16_t>();
+  counts.code = r.read<uint16_t>();
+  counts.map  = r.read<uint16_t>();
+  counts.user = r.read<uint16_t>();
+  counts.font = r.read<uint16_t>();
+
+  uint16_t offset = 0;
+  auto next_base = [&offset](uint16_t count) {
+    SpriteBase base = {.offset = offset, .count = count};
+    offset += count;
+    return base;
+  };
+
+  SpriteBases result = { };
+  result.car  = next_base(counts.car);
+  result.ped  = next_base(counts.ped);
+  result.code = next_base(counts.code);
+  result.map  = next_base(counts.map);
+  result.user = next_base(counts.user);
+  result.font = next_base(counts.font);
+  return result;
+}
+
+struct PaletteBase {
+  uint16_t offset;
+  uint16_t count;
+};
+
+struct PaletteBases {
+  PaletteBase tile;
+  PaletteBase sprite;
+  PaletteBase car;  // car remap
+  PaletteBase ped;  // ped remap
+  PaletteBase code; // code object remap
+  PaletteBase map;  // map object remap
+  PaletteBase user; // user remap
+  PaletteBase font; // font remap
+};
+
+static PaletteBases read_palette_bases(Reader& r) {
+  struct {
+    uint16_t tile;
+    uint16_t sprite;
+    uint16_t car;  // car remap
+    uint16_t ped;  // ped remap
+    uint16_t code; // code object remap
+    uint16_t map;  // map object remap
+    uint16_t user; // user remap
+    uint16_t font; // font remap
+  } counts;
+
+  counts.tile    = r.read<uint16_t>();
+  counts.sprite  = r.read<uint16_t>();
+  counts.car     = r.read<uint16_t>();
+  counts.ped     = r.read<uint16_t>();
+  counts.code    = r.read<uint16_t>();
+  counts.map     = r.read<uint16_t>();
+  counts.user    = r.read<uint16_t>();
+  counts.font    = r.read<uint16_t>();
+
+  uint16_t offset = 0;
+  auto next_base = [&offset](uint16_t count) {
+    PaletteBase base = {.offset = offset, .count = count};
+    offset += count;
+    return base;
+  };
+
+  PaletteBases result = { };
+  result.tile    = next_base(counts.tile);
+  result.sprite  = next_base(counts.sprite);
+  result.car     = next_base(counts.car);
+  result.ped     = next_base(counts.ped);
+  result.code    = next_base(counts.code);
+  result.map     = next_base(counts.map);
+  result.user    = next_base(counts.user);
+  result.font    = next_base(counts.font);
+  return result;
+}
+
 void read_styles(const char* filename) {
   File f;
   if (!f.open("../../../../data/wil.sty")) {
@@ -129,11 +317,6 @@ void read_styles(const char* filename) {
 
   r.skip(sizeof(uint16_t)); // skip version
 
-  Styles styles;
-
-  PaletteIndex palette_index;
-  std::vector<PalettedTile> paletted_tiles;
-  SpriteCounts sprite_counts;
   FontBase font_base;
   std::vector<SpriteDelta> sprite_deltas;
   std::vector<uint8_t> delta_store;
@@ -141,102 +324,44 @@ void read_styles(const char* filename) {
   std::vector<uint8_t> recyclable_cars;
   std::vector<uint8_t> sprite_data_store;
   std::vector<Sprite> sprites;
-  PaletteCounts palette_counts;
   std::vector<CarInfo> cars;
   Surface surfaces[SurfaceType_Count];
+
+  VirtualPaletteTable vtable;
+  PhysicalPalettes palettes;
+  PaletteBases palette_bases;
+  SpriteBases sprite_bases;
+  Tiles tiles;
 
   while (!r.done()) {
     auto chunk_type = r.read<ChunkType>();
     auto chunk_size = r.read<uint32_t>();
 
     switch (shash(chunk_type.name, 4).value()) {
-      case shash("PALX").value(): {  // Palette index
-        assert(chunk_size == sizeof(PaletteIndex));
-        r.read_many<uint16_t>(palette_index.physical_palette, 16384);
+      case shash("PALX").value(): {
+        assert(chunk_size == sizeof(VirtualPaletteTable));
+        vtable = read_virtual_palette_table(r);
         break;
       }
 
-      case shash("PPAL").value(): {  // Physical palettes
-        // Each page contains 64 palettes. Each palette
-        // contains 256 dword colors. Color byte order
-        // is BGRA.
-        //
-        // Within a page palettes are stored interleaved, i.e.
-        // C0P0   - C0P1   - ... - C0P63
-        // C1P0   - C1P1   - ... - C1P63
-        // ...
-        // C255P0 - C255P1 - ... - C255P63
-        //
-        // Where CiPi, is ith color of ith palette.
-
-        assert(chunk_size % sizeof(Palette) == 0);
-
-        constexpr size_t kPageSize = 64;
-        size_t count = chunk_size / sizeof(Palette);
-        size_t pages = count / kPageSize;
-        styles.palettes.resize(count);
-
-        auto convert = [](uint32_t color) {
-          uint8_t alpha = static_cast<uint8_t>(color > 0 ? 0xff : 0); // @TODO: no alpha?
-          return Color{
-            .r = (color >> 16) & 0xff,
-            .g = (color >>  8) & 0xff,
-            .b = (color >>  0) & 0xff,
-            .a = alpha,
-          };
-        };
-
-        for (size_t page = 0; page < pages; ++page) {
-          for (size_t color = 0; color < kPaletteSize; ++color) {
-            for (size_t palette = 0; palette < kPageSize; ++palette) {
-              size_t idx = page * kPageSize + palette;
-              styles.palettes[idx].colors[color] = convert(r.read<uint32_t>());
-            }
-          }
-        }
-        break;
-      }
-
-      case shash("PALB").value():  // Palette base
-        assert(chunk_size == sizeof(PaletteCounts));
-        palette_counts = r.read<PaletteCounts>();
+      case shash("PPAL").value():
+        assert(chunk_size % sizeof(PhysicalPalette) == 0);
+        palettes = read_physical_palettes(r, chunk_size);
         break;
 
-      case shash("TILE").value(): {  // Tiles
-        // tile size := 64x64 uint8_t
-        // 992 tiles in 63 pages
-        // page := 256x256 pixels
-        // virtual palette number = tile number + tile palette base
-
-        constexpr size_t tile_width = 64;
-        constexpr size_t tile_height = 64;
-        constexpr size_t page_width_in_pixels = 256;
-        constexpr size_t page_height_in_pixels = 256;
-        constexpr size_t page_width_in_tiles = page_width_in_pixels / tile_width;
-        constexpr size_t page_height_in_tiles = page_height_in_pixels / tile_height;
-
-        size_t count = chunk_size / (tile_width * tile_height);
-        paletted_tiles.resize(count);
-
-        const uint8_t* data = r.get_ptr<uint8_t>();
-        r.skip(chunk_size);
-
-        for (size_t tile_index = 0; tile_index < count; ++tile_index) {
-          auto& tile = paletted_tiles[tile_index];
-
-          for (size_t y = 0; y < 64; ++y) {
-            for (size_t x = 0; x < 64; ++x) {
-              // All tiles are 64x64. Tiles grouped into pages. Each page is 256 x 256 pixels.
-              size_t tile_row = tile_index / 4;  // tile page height in tiles := 4
-              size_t tile_col = tile_index % 4;  // tile page width in tiles := 4
-
-              size_t idx = x + tile_col * tile_width + (y + tile_row * tile_height) * page_width_in_pixels;
-              tile.color_indices[x + y * tile_width] = data[idx];
-            }
-          }
-        }
+      case shash("PALB").value():
+        assert(chunk_size == 16);
+        palette_bases = read_palette_bases(r);
         break;
-      }
+
+      case shash("SPRB").value():
+        assert(chunk_size == 12);
+        sprite_bases = read_sprite_bases(r);
+        break;
+
+      case shash("TILE").value():
+        tiles = read_tiles(r, chunk_size);
+        break;
 
       case shash("SPRG").value(): // Sprite graphics
         sprite_data_store.resize(chunk_size);
@@ -248,12 +373,6 @@ void read_styles(const char* filename) {
         size_t count = chunk_size / sizeof(Sprite);
         sprites.resize(count);
         r.read_many<Sprite>(sprites.data(), count);
-        break;
-      }
-
-      case shash("SPRB").value(): { // Sprite base index
-        assert(chunk_size == sizeof(SpriteCounts));
-        sprite_counts = r.read<SpriteCounts>();
         break;
       }
 
@@ -332,6 +451,8 @@ void read_styles(const char* filename) {
       }
 
       case shash("PSXT").value(): // PSX tiles
+        assert(!"TODO");
+        r.skip(chunk_size);
         break;
 
       case shash("RECY").value(): // Car recycling info
@@ -372,19 +493,40 @@ void read_styles(const char* filename) {
     }
   }
 
-
   { // Dump palettes
-    std::vector<Color> buf;
-    buf.reserve(styles.palettes.size() * kPaletteSize * sizeof(Color));
-    for (const auto& p : styles.palettes) {
-      for (size_t i = 0; i < kPaletteSize; ++i) {
-        buf.push_back(p.colors[i]);
-      }
+    int width = static_cast<int>(kPhysicalPaletteSize);
+    int height = static_cast<int>(palettes.size());
+    stbi_write_png("palettes.png", width, height, 4, palettes.data(), sizeof(PhysicalPalette));
+  }
+
+  { // Dump tiles
+    if (!std::filesystem::exists("tiles")) {
+      std::filesystem::create_directory("tiles");
     }
 
-    int width = static_cast<int>(kPaletteSize);
-    int height = static_cast<int>(styles.palettes.size());
+    std::vector<Color> buf(kTileDim * kTileDim);
 
-    stbi_write_png("palettes.png", width, height, 4, buf.data(), 4 * width);
+    size_t virtual_palette_index = palette_bases.tile.offset;
+
+    for (const auto& tile : tiles) {
+      size_t physical_palette_index = vtable.map[virtual_palette_index];
+      auto& palette = palettes[physical_palette_index];
+
+      for (size_t i = 0; i < kTileDim * kTileDim; ++i) {
+        uint8_t color_index = tile.colors[i];
+        buf[i] = palette.colors[color_index];
+      }
+
+      auto filename = std::format("tiles/tile{}.png", virtual_palette_index);
+      stbi_write_png(filename.c_str(), kTileDim, kTileDim, 4, buf.data(), kTileDim * sizeof(Color));
+
+      virtual_palette_index++;
+    }
+  }
+
+  { // Dump sprites
+    if (!std::filesystem::exists("sprites")) {
+      std::filesystem::create_directory("sprites");
+    }
   }
 }
