@@ -1,4 +1,7 @@
+#include "styles.h"
+
 #include <Windows.h>
+#include <string>
 
 LRESULT CALLBACK Win32WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   LRESULT result = 0;
@@ -35,6 +38,18 @@ LRESULT CALLBACK Win32WindowProc(HWND window, UINT message, WPARAM wparam, LPARA
 }
 
 int CALLBACK wWinMain(HINSTANCE instance, HINSTANCE previousInstance, LPWSTR cmdLine, int showCode) {
+  wchar_t exe[MAX_PATH] = { };
+  DWORD len = GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+  while (len > 0) {
+    if (exe[--len] == '\\')
+      break;
+  }
+  exe[len] = 0;
+  SetCurrentDirectoryW(exe);
+
+  read_styles("../../../../data/wil.sty");
+
+#if 0
   WNDCLASSW wc = {};
   wc.hInstance = instance;
   wc.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
@@ -54,6 +69,7 @@ int CALLBACK wWinMain(HINSTANCE instance, HINSTANCE previousInstance, LPWSTR cmd
       }
     }
   }
+#endif
 
   return 0;
 }
