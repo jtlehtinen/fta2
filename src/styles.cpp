@@ -1,10 +1,6 @@
 #include "styles.h"
 #include "io.h"
-#include "ext/stb_image_write.h"
 #include "ext/string_hash.h"
-#include <filesystem>
-#include <format>
-#include <vector>
 
 struct ChunkType {
   char name[4];
@@ -24,11 +20,6 @@ static VirtualPaletteTable read_virtual_palette_table(Reader& r, size_t chunk_si
   r.read_many<uint16_t>(result.map, kVirtualPaletteTableSize);
   return result;
 }
-
-struct Color {
-  uint8_t r, g, b, a;
-};
-static_assert(sizeof(Color) == 4);
 
 // kPaletteSize is the number of colors stored in a single palette.
 constexpr size_t kPhysicalPaletteSize = 256;
@@ -113,9 +104,7 @@ static Tiles read_tiles(Reader& r, size_t chunk_size) {
   return result;
 }
 
-using IndexedColor = uint8_t;
-
-using SpriteStore = std::vector<IndexedColor>;
+using SpriteStore = std::vector<uint8_t>;
 
 static SpriteStore read_sprite_store(Reader& r, size_t chunk_size) {
   SpriteStore result(chunk_size);
@@ -123,31 +112,31 @@ static SpriteStore read_sprite_store(Reader& r, size_t chunk_size) {
   return result;
 }
 
-struct Sprite {
+struct GTASprite {
   uint32_t offset; // sprite store offset
   uint8_t width;
   uint8_t height;
 };
 
-using Sprites = std::vector<Sprite>;
+using GTASprites = std::vector<GTASprite>;
 
-static Sprites read_sprites(Reader& r, size_t chunk_size) {
+static GTASprites read_sprites(Reader& r, size_t chunk_size) {
   assert(chunk_size % 8 == 0);
 
-  struct SpriteTransfer {
+  struct GTASpriteTransfer {
     uint32_t offset; // sprite store offset
     uint8_t  width;
     uint8_t  height;
     uint16_t pad;
   };
 
-  size_t count = chunk_size / sizeof(SpriteTransfer);
+  size_t count = chunk_size / sizeof(GTASpriteTransfer);
 
-  Sprites result(count);
+  GTASprites result(count);
 
   for (size_t i = 0; i < count; ++i) {
-    auto s = r.read<SpriteTransfer>();
-    result[i] = Sprite{
+    auto s = r.read<GTASpriteTransfer>();
+    result[i] = GTASprite{
       .offset = s.offset,
       .width = s.width,
       .height = s.height,
@@ -477,16 +466,142 @@ struct DeltaStoreEntry {
   uint8_t data[];
 };
 
-void read_styles(const char* filename) {
+static std::vector<Sprite> import_sprites(
+  const SpriteStore& store,
+  const GTASprites& sprites,
+  const PaletteBases& palette_bases,
+  const VirtualPaletteTable& vtable,
+  const PhysicalPalettes& palettes)
+{
+  constexpr size_t kPageSize = 256;
+
+  std::vector<Sprite> result(sprites.size());
+
+  for (size_t i = 0; i < sprites.size(); ++i) {
+    auto& src = sprites[i];
+    auto& dest = result[i];
+
+    dest.width = src.width;
+    dest.height = src.height;
+    dest.pixels.resize(src.width * src.height);
+
+    size_t virtual_palette_index = palette_bases.sprite.offset + i;
+    size_t physical_palette_index = vtable.map[virtual_palette_index];
+    auto& palette = palettes[physical_palette_index];
+
+    size_t xoffset = src.offset % kPageSize;
+    size_t yoffset = src.offset / kPageSize;
+
+    for (size_t y = 0; y < src.height; ++y) {
+      for (size_t x = 0; x < src.width; ++x) {
+        auto color_index = store[x + xoffset + (y + yoffset) * kPageSize];
+        dest.pixels[x + y * src.width] = palette.colors[color_index];
+      }
+    }
+  }
+
+  return result;
+}
+
+static std::vector<Sprite> import_tiles(
+  const Tiles& tiles,
+  const PaletteBases& palette_bases,
+  const VirtualPaletteTable& vtable,
+  const PhysicalPalettes& palettes)
+{
+  std::vector<Sprite> result(tiles.size());
+
+  for (size_t i = 0; i < tiles.size(); ++i) {
+    auto& src = tiles[i];
+    auto& dest = result[i];
+
+    dest.width = kTileDim;
+    dest.height = kTileDim;
+    dest.pixels.resize(kTileDim * kTileDim);
+
+    size_t virtual_palette_index = palette_bases.tile.offset + i;
+    size_t physical_palette_index = vtable.map[virtual_palette_index];
+    auto& palette = palettes[physical_palette_index];
+
+    for (size_t px = 0; px < kTileDim * kTileDim; ++px) {
+      auto color_index = src.colors[px];
+      dest.pixels[px] = palette.colors[color_index];
+    }
+  }
+
+  return result;
+}
+
+static std::vector<Sprite> import_deltas(
+  const std::vector<Sprite>& sprites,
+  const DeltaStore& store,
+  const Deltas& deltas,
+  const PaletteBases& palette_bases,
+  const VirtualPaletteTable& vtable,
+  const PhysicalPalettes& palettes)
+{
+  std::vector<Sprite> result;
+
+  size_t store_offset = 0;
+
+  for (auto& set : deltas) {
+    size_t virtual_palette_index = palette_bases.sprite.offset + set.sprite;
+    size_t physical_palette_index = vtable.map[virtual_palette_index];
+    auto& palette = palettes[physical_palette_index];
+
+    size_t delta_index = 0;
+    for (auto size : set.sizes) {
+      auto sprite = sprites[set.sprite];
+
+      size_t bytes = 0;
+      uint32_t position = 0;
+
+      while (bytes < size) {
+        auto entry = reinterpret_cast<const DeltaStoreEntry*>(store.data() + store_offset);
+
+        position += entry->offset;
+        size_t x = position % 256;
+        size_t y = position / 256;
+        position += entry->length;
+
+        for (size_t j = 0; j < entry->length; ++j) {
+          auto color_index = entry->data[j];
+          sprite.pixels[x + j + y * sprite.width] = palette.colors[color_index];
+        }
+
+        bytes += 3 + entry->length;
+        store_offset += 3 + entry->length;
+      }
+
+      result.push_back(sprite);
+    }
+  }
+
+  return result;
+}
+
+static std::vector<uint16_t> import_delta_sprites(const Deltas& deltas) {
+  std::vector<uint16_t> result;
+
+ for (auto& d : deltas) {
+   for (auto _ : d.sizes) {
+     result.push_back(d.sprite);
+   }
+ }
+
+  return result;
+}
+
+bool Styles::load(const char* filename) {
   File f;
   if (!f.open("../../../../data/wil.sty")) {
-    return;
+    return false;
   }
 
   auto fsize = f.size();
   std::vector<uint8_t> buf(fsize);
   if (!f.read(buf.data(), fsize)) {
-    return;
+    return false;
   }
   f.close();
 
@@ -496,7 +611,7 @@ void read_styles(const char* filename) {
   r.read_many<char>(magic, 4);
   if (memcmp(magic, "GBST", 4) != 0) {
     // @TODO: Error not a valid GBH style file.
-    return;
+    return false;
   }
 
   r.skip(sizeof(uint16_t)); // skip version
@@ -506,7 +621,7 @@ void read_styles(const char* filename) {
   PaletteBases palette_bases;
   SpriteBases sprite_bases;
   SpriteStore sprite_store;
-  Sprites sprites;
+  GTASprites sprites;
   DeltaStore delta_store;
   Deltas deltas;
   Tiles tiles;
@@ -588,142 +703,10 @@ void read_styles(const char* filename) {
     }
   }
 
-  #if 0
-  { // Dump palettes
-    int width = static_cast<int>(kPhysicalPaletteSize);
-    int height = static_cast<int>(palettes.size());
-    stbi_write_png("palettes.png", width, height, 4, palettes.data(), sizeof(PhysicalPalette));
-  }
-  #endif
+  this->sprites = import_sprites(sprite_store, sprites, palette_bases, vtable, palettes);
+  this->tiles = import_tiles(tiles, palette_bases, vtable, palettes);
+  this->deltas = import_deltas(this->sprites, delta_store, deltas, palette_bases, vtable, palettes);
+  this->delta_sprites = import_delta_sprites(deltas);
 
-  #if 0
-  { // Dump tiles
-    std::filesystem::create_directory("tiles");
-
-    std::vector<Color> buf(kTileDim * kTileDim);
-
-    size_t virtual_palette_index = palette_bases.tile.offset;
-
-    for (const auto& tile : tiles) {
-      size_t physical_palette_index = vtable.map[virtual_palette_index];
-      auto& palette = palettes[physical_palette_index];
-
-      for (size_t i = 0; i < kTileDim * kTileDim; ++i) {
-        uint8_t color_index = tile.colors[i];
-        buf[i] = palette.colors[color_index];
-      }
-
-      auto filename = std::format("tiles/tile{}.png", virtual_palette_index);
-      stbi_write_png(filename.c_str(), kTileDim, kTileDim, 4, buf.data(), kTileDim * sizeof(Color));
-
-      virtual_palette_index++;
-    }
-  }
-  #endif
-
-  #if 1
-  { // Dump sprites
-    std::filesystem::create_directory("sprites");
-
-    constexpr size_t kMaxSpriteWidth = 256;
-    constexpr size_t kMaxSpriteHeight = 256;
-    std::vector<Color> buf(kMaxSpriteWidth * kMaxSpriteHeight);
-
-    constexpr size_t kPageSize = 256;
-    auto sprite_color_index = [](SpriteStore& store, size_t xoffset, size_t yoffset, size_t x, size_t y) {
-      return store[xoffset + x + (yoffset + y) * kPageSize];
-    };
-
-    auto create_sprite_filename = [](SpriteBases& bases, size_t sprite_index) {
-      if (sprite_index >= bases.car.offset && sprite_index < bases.ped.offset) {
-        return std::format("sprites/car_{}.png", sprite_index - bases.car.offset);
-      }
-
-      if (sprite_index >= bases.ped.offset && sprite_index < bases.code.offset) {
-        return std::format("sprites/ped_{}.png", sprite_index - bases.ped.offset);
-      }
-
-      if (sprite_index >= bases.code.offset && sprite_index < bases.map.offset) {
-        return std::format("sprites/code_{}.png", sprite_index - bases.code.offset);
-      }
-
-      if (sprite_index >= bases.map.offset && sprite_index < bases.user.offset) {
-        return std::format("sprites/map_{}.png", sprite_index - bases.map.offset);
-      }
-
-      if (sprite_index >= bases.user.offset && sprite_index < bases.font.offset) {
-        return std::format("sprites/user_{}.png", sprite_index - bases.user.offset);
-      }
-
-      return std::format("sprites/font_{}.png", sprite_index - bases.font.offset);
-    };
-
-    size_t virtual_palette_index = palette_bases.sprite.offset;
-    size_t sprite_index = 0;
-
-    for (const auto& sprite : sprites) {
-      size_t physical_palette_index = vtable.map[virtual_palette_index + sprite_index];
-      auto& palette = palettes[physical_palette_index];
-
-      size_t xoffset = sprite.offset % kPageSize;
-      size_t yoffset = sprite.offset / kPageSize;
-
-      for (size_t y = 0; y < sprite.height; ++y) {
-        for (size_t x = 0; x < sprite.width; ++x) {
-          auto color_index = sprite_color_index(sprite_store, xoffset, yoffset, x, y);
-          buf[x + y * sprite.width] = palette.colors[color_index];
-        }
-      }
-
-      auto filename = create_sprite_filename(sprite_bases, sprite_index);
-      stbi_write_png(filename.c_str(), sprite.width, sprite.height, 4, buf.data(), sprite.width * sizeof(Color));
-      sprite_index++;
-    }
-  }
-  #endif
-
-  { // Dump sprite deltas
-    std::filesystem::create_directory("deltas");
-
-    size_t store_offset = 0;
-
-    for (auto& set : deltas) {
-      size_t virtual_palette_index = palette_bases.sprite.offset + set.sprite;
-      size_t physical_palette_index = vtable.map[virtual_palette_index];
-      auto& palette = palettes[physical_palette_index];
-
-      Sprite sprite = sprites[set.sprite];
-
-      size_t delta_index = 0;
-      for (auto size : set.sizes) {
-        std::vector<Color> buf(sprite.width * sprite.height, Color{});
-
-        size_t bytes = 0;
-        uint32_t position = 0;
-
-        while (bytes < size) {
-          auto entry = reinterpret_cast<const DeltaStoreEntry*>(delta_store.data() + store_offset);
-
-          position += entry->offset;
-          size_t x = position % 256;
-          size_t y = position / 256;
-          position += entry->length;
-
-          for (size_t j = 0; j < entry->length; ++j) {
-            auto color_index = entry->data[j];
-            auto color = palette.colors[color_index];
-            buf[x + j + y * sprite.width] = color;
-          }
-
-          bytes += 3 + entry->length;
-          store_offset += 3 + entry->length;
-        }
-
-        auto filename = std::format("deltas/{}_{}.png", set.sprite, delta_index);
-        stbi_write_png(filename.c_str(), sprite.width, sprite.height, 4, buf.data(), sprite.width * sizeof(Color));
-
-        delta_index++;
-      }
-    }
-  }
+  return true;
 }
