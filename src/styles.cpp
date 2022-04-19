@@ -6,75 +6,6 @@
 #include <format>
 #include <vector>
 
-enum SurfaceType : uint8_t {
-  SurfaceType_Grass = 0,
-  SurfaceType_RoadSpecial = 1,
-  SurfaceType_Water = 2,
-  SurfaceType_Electrified = 3,
-  SurfaceType_ElectrifiedPlatform = 4,
-  SurfaceType_WoodFloor = 5,
-  SurfaceType_MetalFloor = 6,
-  SurfaceType_MetalWall = 7,
-  SurfaceType_GrassWall = 8,
-
-  SurfaceType_Count
-};
-
-struct FontBase {
-  uint16_t num_characters_per_font;
-  std::vector<uint16_t> base;
-};
-
-struct SpriteDelta {
-  uint16_t sprite;
-  std::vector<uint16_t> sizes;
-};
-
-struct MapObject {
-  uint8_t model;
-  uint8_t sprites;
-};
-
-struct PaletteCounts {
-  uint16_t tile;
-  uint16_t sprite;
-  uint16_t car_remap;
-  uint16_t ped_remap;
-  uint16_t code_object_remap;
-  uint16_t map_object_remap;
-  uint16_t user_remap;
-  uint16_t font_remap;
-};
-
-struct DoorInfo {
-  int8_t relativeX;           // X position relative to the center of the car.
-  int8_t relativeY;           // Y position relative to the center of the car.
-};
-
-struct CarInfo {
-  uint8_t model;              // Car model number.
-  uint8_t sprite;             // Relative car sprite number.
-  uint8_t width;              // Width of the car in pixels. Might be different than the sprite width (collision detection).
-  uint8_t height;             // Height of the car in pixels. Might be different than the sprite height (collision detection).
-  uint8_t num_remaps;
-  uint8_t passengers;         // Number of passengers the car can carry.
-  uint8_t wreck;              // Wreck graphic number to use when this car is wrecked (0-8, or 99 if can't wreck).
-  uint8_t rating;             // Quality rating for this car used to decide how often it is created in different areas of the city.
-  int8_t front_wheel_offset;    // Distance from the center of the car to the front axle.
-  int8_t rear_wheel_offset;     // Distance from the center of the car to the back axle.
-  int8_t front_window_offset;   // Distance from the center of the car to the front window.
-  int8_t rear_window_offset;    // Distance from the center of the car to the back window.
-  uint8_t info_flags;
-  uint8_t info_flags2;
-  std::vector<uint8_t> remap; // Virtual palette numbers, representing all of the alternative palettes which can sensibly be applied to this car. Note that these palette numbers are relative to the start of the car remap palette area.
-  uint8_t num_doors;
-  std::vector<DoorInfo> doors;
-};
-
-struct Surface {
-  std::vector<uint16_t> tiles;
-};
-
 struct ChunkType {
   char name[4];
 };
@@ -86,7 +17,9 @@ struct VirtualPaletteTable {
 };
 static_assert(sizeof(VirtualPaletteTable) == kVirtualPaletteTableSize * sizeof(uint16_t));
 
-static VirtualPaletteTable read_virtual_palette_table(Reader& r) {
+static VirtualPaletteTable read_virtual_palette_table(Reader& r, size_t chunk_size) {
+  assert(chunk_size == sizeof(VirtualPaletteTable));
+
   VirtualPaletteTable result;
   r.read_many<uint16_t>(result.map, kVirtualPaletteTableSize);
   return result;
@@ -107,6 +40,8 @@ struct PhysicalPalette {
 using PhysicalPalettes = std::vector<PhysicalPalette>;
 
 static PhysicalPalettes read_physical_palettes(Reader& r, size_t chunk_size) {
+  assert(chunk_size % sizeof(PhysicalPalette) == 0);
+
   // Each page contains 64 palettes. Each palette
   // contains 256 dword colors. Color byte order
   // is BGRA.
@@ -197,6 +132,8 @@ struct Sprite {
 using Sprites = std::vector<Sprite>;
 
 static Sprites read_sprites(Reader& r, size_t chunk_size) {
+  assert(chunk_size % 8 == 0);
+
   struct SpriteTransfer {
     uint32_t offset; // sprite store offset
     uint8_t  width;
@@ -234,7 +171,9 @@ struct SpriteBases {
   SpriteBase font;
 };
 
-static SpriteBases read_sprite_bases(Reader& r) {
+static SpriteBases read_sprite_bases(Reader& r, size_t chunk_size) {
+  assert(chunk_size == 12);
+
   struct {
     uint16_t car;
     uint16_t ped;
@@ -284,7 +223,9 @@ struct PaletteBases {
   PaletteBase font; // font remap
 };
 
-static PaletteBases read_palette_bases(Reader& r) {
+static PaletteBases read_palette_bases(Reader& r, size_t chunk_size) {
+  assert(chunk_size == 16);
+
   struct {
     uint16_t tile;
     uint16_t sprite;
@@ -324,6 +265,218 @@ static PaletteBases read_palette_bases(Reader& r) {
   return result;
 }
 
+using CarModelNumber = uint8_t;
+
+std::vector<CarModelNumber> read_recyclable_cars(Reader& r, size_t chunk_size) {
+  assert(chunk_size <= 64);
+
+  constexpr size_t kMaxCars = 64;
+
+  std::vector<CarModelNumber> result;
+  for (size_t i = 0; i < kMaxCars; ++i) {
+    auto value = r.read<CarModelNumber>();
+    if (value == 255) break;
+
+    result.push_back(value);
+  }
+  return result;
+}
+
+using DeltaStore = std::vector<uint8_t>;
+
+static DeltaStore read_delta_store(Reader& r, size_t chunk_size) {
+  DeltaStore result(chunk_size);
+  r.read_many<uint8_t>(result.data(), chunk_size);
+  return result;
+}
+
+// DeltaSet uses the same palette as the sprite.
+struct DeltaSet {
+  uint16_t sprite; // sprite number
+  std::vector<uint16_t> sizes; // size in bytes of each of the deltas in this set
+};
+
+using Deltas = std::vector<DeltaSet>;
+
+static Deltas read_deltas(Reader& r, size_t chunk_size) {
+  Deltas result;
+
+  size_t bytes = 0;
+  while (bytes < chunk_size) {
+    auto sprite = r.read<uint16_t>();
+    auto count = r.read<uint8_t>();
+    r.skip(sizeof(uint8_t));
+
+    DeltaSet set = {.sprite = sprite};
+    set.sizes.resize(count);
+
+    for (size_t i = 0; i < count; ++i) {
+      set.sizes[i] = r.read<uint16_t>();
+    }
+
+    result.push_back(set);
+
+    bytes += 4 + count * sizeof(uint16_t);
+  }
+
+  return result;
+}
+
+struct FontBase {
+  uint16_t offset;
+  uint16_t count;
+};
+
+using FontBases = std::vector<FontBase>;
+
+static FontBases read_font_bases(Reader& r, size_t chunk_size) {
+  uint16_t count = r.read<uint16_t>();
+
+  std::vector<uint16_t> counts(count);
+  r.read_many<uint16_t>(counts.data(), count);
+
+  uint16_t offset = 0;
+  auto next_base = [&offset](uint16_t count) {
+    FontBase base = {.offset = offset, .count = count};
+    offset += count;
+    return base;
+  };
+
+  FontBases result(count);
+  for (size_t i = 0; i < count; ++i) {
+    result[i] = next_base(counts[i]);
+  }
+  return result;
+}
+
+struct MapObject {
+  uint8_t model; // object model number
+  uint8_t sprites; // number of sprites stored for this model
+};
+
+using MapObjects = std::vector<MapObject>;
+
+static MapObjects read_map_objects(Reader& r, size_t chunk_size) {
+  assert(chunk_size % sizeof(MapObject) == 0);
+  size_t count = chunk_size / sizeof(MapObject);
+
+  MapObjects result(count);
+  r.read_many<MapObject>(result.data(), count);
+  return result;
+}
+
+enum SurfaceType : uint8_t {
+  SurfaceType_Grass = 0,
+  SurfaceType_RoadSpecial = 1,
+  SurfaceType_Water = 2,
+  SurfaceType_Electrified = 3,
+  SurfaceType_ElectrifiedPlatform = 4,
+  SurfaceType_WoodFloor = 5,
+  SurfaceType_MetalFloor = 6,
+  SurfaceType_MetalWall = 7,
+  SurfaceType_GrassWall = 8,
+
+  SurfaceType_Count
+};
+
+using SurfaceTiles = std::vector<uint16_t>;
+using Surfaces = std::vector<SurfaceTiles>;
+
+static Surfaces read_surface_tiles(Reader& r, size_t chunk_size) {
+  uint8_t type = 0;
+  size_t bytes = 0;
+
+  Surfaces result(SurfaceType_Count);
+
+  while (type < SurfaceType_Count && bytes < chunk_size) {
+    SurfaceTiles tiles;
+
+    while (bytes < chunk_size) {
+      uint16_t value = r.read<uint16_t>();
+      bytes += sizeof(uint16_t);
+      if (value == 0) break;
+
+      tiles.push_back(value);
+    }
+
+    result[type] = tiles;
+    ++type;
+  }
+
+  return result;
+}
+
+struct Door {
+  int8_t relativeX;           // X position relative to the center of the car.
+  int8_t relativeY;           // Y position relative to the center of the car.
+};
+
+struct Car {
+  uint8_t model;              // Car model number.
+  uint8_t sprite;             // Relative car sprite number.
+  uint8_t width;              // Width of the car in pixels. Might be different than the sprite width (collision detection).
+  uint8_t height;             // Height of the car in pixels. Might be different than the sprite height (collision detection).
+  uint8_t num_remaps;
+  uint8_t passengers;         // Number of passengers the car can carry.
+  uint8_t wreck;              // Wreck graphic number to use when this car is wrecked (0-8, or 99 if can't wreck).
+  uint8_t rating;             // Quality rating for this car used to decide how often it is created in different areas of the city.
+  int8_t front_wheel_offset;    // Distance from the center of the car to the front axle.
+  int8_t rear_wheel_offset;     // Distance from the center of the car to the back axle.
+  int8_t front_window_offset;   // Distance from the center of the car to the front window.
+  int8_t rear_window_offset;    // Distance from the center of the car to the back window.
+  uint8_t info_flags;
+  uint8_t info_flags2;
+  std::vector<uint8_t> remap; // Virtual palette numbers, representing all of the alternative palettes which can sensibly be applied to this car. Note that these palette numbers are relative to the start of the car remap palette area.
+  uint8_t num_doors;
+  std::vector<Door> doors;
+};
+
+using Cars = std::vector<Car>;
+
+static Cars read_cars(Reader& r, size_t chunk_size) {
+  Cars result;
+
+  size_t bytes = 0;
+  while (bytes < chunk_size) {
+    Car car = { };
+    car.model = r.read<uint8_t>();
+    car.sprite = r.read<uint8_t>();
+    car.width = r.read<uint8_t>();
+    car.height = r.read<uint8_t>();
+    car.num_remaps = r.read<uint8_t>();
+    car.passengers = r.read<uint8_t>();
+    car.wreck = r.read<uint8_t>();
+    car.rating = r.read<uint8_t>();
+    car.front_wheel_offset = r.read<int8_t>();
+    car.rear_wheel_offset = r.read<int8_t>();
+    car.front_window_offset = r.read<int8_t>();
+    car.rear_window_offset = r.read<int8_t>();
+    car.info_flags = r.read<uint8_t>();
+    car.info_flags2 = r.read<uint8_t>();
+
+    car.remap.resize(car.num_remaps);
+    r.read_many<uint8_t>(car.remap.data(), car.num_remaps);
+
+    car.num_doors = r.read<uint8_t>();
+
+    car.doors.resize(car.num_doors);
+    r.read_many<Door>(car.doors.data(), car.num_doors);
+
+    result.push_back(car);
+
+    bytes += 15 + car.num_remaps * sizeof(uint8_t) + car.num_doors * sizeof(Door);
+  }
+
+  return result;
+}
+
+struct DeltaStoreEntry {
+  uint16_t offset;
+  uint8_t length;
+  #pragma warning(suppress:4200)
+  uint8_t data[];
+};
+
 void read_styles(const char* filename) {
   File f;
   if (!f.open("../../../../data/wil.sty")) {
@@ -348,46 +501,40 @@ void read_styles(const char* filename) {
 
   r.skip(sizeof(uint16_t)); // skip version
 
-  FontBase font_base;
-  std::vector<SpriteDelta> sprite_deltas;
-  std::vector<uint8_t> delta_store;
-  std::vector<MapObject> object_infos;
-  std::vector<uint8_t> recyclable_cars;
-  std::vector<CarInfo> cars;
-  Surface surfaces[SurfaceType_Count];
-
   VirtualPaletteTable vtable;
   PhysicalPalettes palettes;
   PaletteBases palette_bases;
   SpriteBases sprite_bases;
   SpriteStore sprite_store;
   Sprites sprites;
+  DeltaStore delta_store;
+  Deltas deltas;
   Tiles tiles;
+  FontBases font_bases;
+  MapObjects map_objects;
+  Surfaces surfaces;
+  std::vector<CarModelNumber> recyclable_cars;
+  Cars cars;
 
   while (!r.done()) {
     auto chunk_type = r.read<ChunkType>();
     auto chunk_size = r.read<uint32_t>();
 
     switch (shash(chunk_type.name, 4).value()) {
-      case shash("PALX").value(): {
-        assert(chunk_size == sizeof(VirtualPaletteTable));
-        vtable = read_virtual_palette_table(r);
+      case shash("PALX").value():
+        vtable = read_virtual_palette_table(r, chunk_size);
         break;
-      }
 
       case shash("PPAL").value():
-        assert(chunk_size % sizeof(PhysicalPalette) == 0);
         palettes = read_physical_palettes(r, chunk_size);
         break;
 
       case shash("PALB").value():
-        assert(chunk_size == 16);
-        palette_bases = read_palette_bases(r);
+        palette_bases = read_palette_bases(r, chunk_size);
         break;
 
       case shash("SPRB").value():
-        assert(chunk_size == 12);
-        sprite_bases = read_sprite_bases(r);
+        sprite_bases = read_sprite_bases(r, chunk_size);
         break;
 
       case shash("TILE").value():
@@ -399,120 +546,41 @@ void read_styles(const char* filename) {
         break;
 
       case shash("SPRX").value():
-        assert(chunk_size % 8 == 0);
         sprites = read_sprites(r, chunk_size);
         break;
 
-      case shash("DELS").value(): // Delta store
-        delta_store.resize(chunk_size);
-        r.read_many<uint8_t>(delta_store.data(), chunk_size);
+      case shash("DELS").value():
+        delta_store = read_delta_store(r, chunk_size);
         break;
 
-      case shash("DELX").value(): { // Delta index
-        size_t bytes = 0;
-        while (bytes < chunk_size) {
-          SpriteDelta delta;
-          delta.sprite = r.read<uint16_t>();
-          uint8_t count = r.read<uint8_t>();
-          r.skip(sizeof(uint8_t));
-
-          for (size_t i = 0; i < count; ++i) {
-            delta.sizes.push_back(r.read<uint16_t>());
-          }
-
-          sprite_deltas.push_back(delta);
-          bytes += 4 + count * sizeof(uint16_t);
-        }
+      case shash("DELX").value():
+        deltas = read_deltas(r, chunk_size);
         break;
-      }
 
-      case shash("FONB").value(): {  // Font base
-        uint16_t count = r.read<uint16_t>();
-        font_base.num_characters_per_font = count;
-        font_base.base.resize(count);
-        r.read_many<uint16_t>(font_base.base.data(), count);
+      case shash("FONB").value():
+        font_bases = read_font_bases(r, chunk_size);
         break;
-      }
 
-      case shash("CARI").value(): { // Car info
-        size_t bytes = 0;
-        while (bytes < chunk_size) {
-          CarInfo info = { };
-          info.model = r.read<uint8_t>();
-          info.sprite = r.read<uint8_t>();
-          info.width = r.read<uint8_t>();
-          info.height = r.read<uint8_t>();
-          info.num_remaps = r.read<uint8_t>();
-          info.passengers = r.read<uint8_t>();
-          info.wreck = r.read<uint8_t>();
-          info.rating = r.read<uint8_t>();
-          info.front_wheel_offset = r.read<int8_t>();
-          info.rear_wheel_offset = r.read<int8_t>();
-          info.front_window_offset = r.read<int8_t>();
-          info.rear_window_offset = r.read<int8_t>();
-          info.info_flags = r.read<uint8_t>();
-          info.info_flags2 = r.read<uint8_t>();
-
-          info.remap.resize(info.num_remaps);
-          r.read_many<uint8_t>(info.remap.data(), info.num_remaps);
-
-          info.num_doors = r.read<uint8_t>();
-
-          info.doors.resize(info.num_doors);
-          r.read_many<DoorInfo>(info.doors.data(), info.num_doors);
-
-          cars.push_back(info);
-
-          bytes += 15 + info.num_remaps * sizeof(uint8_t) + info.num_doors * sizeof(DoorInfo);
-        }
+      case shash("CARI").value():
+        cars = read_cars(r, chunk_size);
         break;
-      }
 
-      case shash("OBJI").value(): { // Map object info
-        assert(chunk_size % sizeof(MapObject) == 0);
-        size_t count = chunk_size / sizeof(MapObject);
-
-        object_infos.resize(count);
-        r.read_many<MapObject>(object_infos.data(), count);
+      case shash("OBJI").value():
+        map_objects = read_map_objects(r, chunk_size);
         break;
-      }
 
       case shash("PSXT").value(): // PSX tiles
         assert(!"TODO");
         r.skip(chunk_size);
         break;
 
-      case shash("RECY").value(): // Car recycling info
-        assert(chunk_size <= 64);
-
-        for (size_t i = 0; i < chunk_size; ++i) {
-          uint8_t value = r.read<uint8_t>();
-          if (value == 255) break;
-
-          recyclable_cars.push_back(value);
-        }
+      case shash("RECY").value():
+        recyclable_cars = read_recyclable_cars(r, chunk_size);
         break;
 
-      case shash("SPEC").value(): { // Spec... surface behavior
-        uint8_t type = 0;
-        size_t bytes = 0;
-
-        while (type < SurfaceType_Count && bytes < chunk_size) {
-          Surface surface;
-
-          while (bytes < chunk_size) {
-            uint16_t value = r.read<uint16_t>();
-            bytes += sizeof(uint16_t);
-            if (value == 0) break;
-
-            surface.tiles.push_back(value);
-          }
-
-          surfaces[type] = surface;
-          ++type;
-        }
+      case shash("SPEC").value():
+        surfaces = read_surface_tiles(r, chunk_size);
         break;
-      }
 
       default:
         // @TODO: Error unknown chunk type...
@@ -614,6 +682,48 @@ void read_styles(const char* filename) {
   }
   #endif
 
+  { // Dump sprite deltas
+    std::filesystem::create_directory("deltas");
 
+    size_t store_offset = 0;
 
+    for (auto& set : deltas) {
+      size_t virtual_palette_index = palette_bases.sprite.offset + set.sprite;
+      size_t physical_palette_index = vtable.map[virtual_palette_index];
+      auto& palette = palettes[physical_palette_index];
+
+      Sprite sprite = sprites[set.sprite];
+
+      size_t delta_index = 0;
+      for (auto size : set.sizes) {
+        std::vector<Color> buf(sprite.width * sprite.height, Color{});
+
+        size_t bytes = 0;
+        uint32_t position = 0;
+
+        while (bytes < size) {
+          auto entry = reinterpret_cast<const DeltaStoreEntry*>(delta_store.data() + store_offset);
+
+          position += entry->offset;
+          size_t x = position % 256;
+          size_t y = position / 256;
+          position += entry->length;
+
+          for (size_t j = 0; j < entry->length; ++j) {
+            auto color_index = entry->data[j];
+            auto color = palette.colors[color_index];
+            buf[x + j + y * sprite.width] = color;
+          }
+
+          bytes += 3 + entry->length;
+          store_offset += 3 + entry->length;
+        }
+
+        auto filename = std::format("deltas/{}_{}.png", set.sprite, delta_index);
+        stbi_write_png(filename.c_str(), sprite.width, sprite.height, 4, buf.data(), sprite.width * sizeof(Color));
+
+        delta_index++;
+      }
+    }
+  }
 }
