@@ -530,9 +530,7 @@ void read_styles(const char* filename) {
 
   #if 0
   { // Dump tiles
-    if (!std::filesystem::exists("tiles")) {
-      std::filesystem::create_directory("tiles");
-    }
+    std::filesystem::create_directory("tiles");
 
     std::vector<Color> buf(kTileDim * kTileDim);
 
@@ -555,10 +553,9 @@ void read_styles(const char* filename) {
   }
   #endif
 
+  #if 1
   { // Dump sprites
-    if (!std::filesystem::exists("sprites")) {
-      std::filesystem::create_directory("sprites");
-    }
+    std::filesystem::create_directory("sprites");
 
     constexpr size_t kMaxSpriteWidth = 256;
     constexpr size_t kMaxSpriteHeight = 256;
@@ -569,10 +566,35 @@ void read_styles(const char* filename) {
       return store[xoffset + x + (yoffset + y) * kPageSize];
     };
 
+    auto create_sprite_filename = [](SpriteBases& bases, size_t sprite_index) {
+      if (sprite_index >= bases.car.offset && sprite_index < bases.ped.offset) {
+        return std::format("sprites/car_{}.png", sprite_index - bases.car.offset);
+      }
+
+      if (sprite_index >= bases.ped.offset && sprite_index < bases.code.offset) {
+        return std::format("sprites/ped_{}.png", sprite_index - bases.ped.offset);
+      }
+
+      if (sprite_index >= bases.code.offset && sprite_index < bases.map.offset) {
+        return std::format("sprites/code_{}.png", sprite_index - bases.code.offset);
+      }
+
+      if (sprite_index >= bases.map.offset && sprite_index < bases.user.offset) {
+        return std::format("sprites/map_{}.png", sprite_index - bases.map.offset);
+      }
+
+      if (sprite_index >= bases.user.offset && sprite_index < bases.font.offset) {
+        return std::format("sprites/user_{}.png", sprite_index - bases.user.offset);
+      }
+
+      return std::format("sprites/font_{}.png", sprite_index - bases.font.offset);
+    };
+
     size_t virtual_palette_index = palette_bases.sprite.offset;
+    size_t sprite_index = 0;
 
     for (const auto& sprite : sprites) {
-      size_t physical_palette_index = vtable.map[virtual_palette_index];
+      size_t physical_palette_index = vtable.map[virtual_palette_index + sprite_index];
       auto& palette = palettes[physical_palette_index];
 
       size_t xoffset = sprite.offset % kPageSize;
@@ -585,10 +607,13 @@ void read_styles(const char* filename) {
         }
       }
 
-      auto filename = std::format("sprites/sprite{}.png", virtual_palette_index);
+      auto filename = create_sprite_filename(sprite_bases, sprite_index);
       stbi_write_png(filename.c_str(), sprite.width, sprite.height, 4, buf.data(), sprite.width * sizeof(Color));
-
-      virtual_palette_index++;
+      sprite_index++;
     }
   }
+  #endif
+
+
+
 }
